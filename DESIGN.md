@@ -14,7 +14,9 @@ Take a free-form bedtime story request and generate a story appropriate for ages
 flowchart TD
     U[User] -->|story request| G[Generator\nfew-shot prompt, no fixed categories]
     G --> PC{Deterministic\npre-check}
-    PC -->|fail: length / word-list hit| G
+    PC -->|too short| EXP[Expand: append\none new scene]
+    EXP --> PC
+    PC -->|too long / unsafe word| G
     PC -->|pass| J1[Judge 1\nchecklist-based safety + quality]
     PC -->|pass| J2[Judge 2\nholistic safety, no fixed list]
     J1 --> D{safety_pass AND\nquality >= threshold?}
@@ -33,46 +35,39 @@ flowchart TD
 ## Components
 
 ### 1. Generator
-- Role-based prompt ("children's book author for ages 5-10")
+- Role-based prompt ("children's book author for ages 5-10").
 - 3 few-shot examples embedded in-prompt, each showing a different
   request -> TONE/PACING combination (calm bedtime, energetic adventure,
   gentle moral-lesson). No fixed category enum -- the model infers the
   right style per-request by analogy, including for requests that don't
-  resemble any example. Length is deliberately NOT varied across the
-  examples (all meet the same 300-word floor) -- it's stated as a
-  separate hard rule instead, so there's nothing for the model to
-  (mis)infer from example length.
+  resemble any example.
+- Length is stated as an explicit rule (300-2000 words) separate from the
+  examples, which keeps tone/pacing and length as independent concerns --
+  every example meets the same length rule, so style comes from analogy
+  and length comes from the rule.
 - If the user's own wording implies a pace ("a quick story", "a long
-  adventure"), the prompt instructs the model to honor that directly over
-  the few-shot defaults.
-- On regeneration, the prior draft + judge's specific feedback (or user's
-  free-text feedback) is included as a revision instruction -- targeted
-  patch, not a blind rewrite.
+  adventure"), the prompt honors that directly.
+- On regeneration, the prior draft plus specific, targeted feedback (from
+  the pre-check, the judges, or the user) is included as a revision
+  instruction -- a targeted patch, not a blind rewrite.
 
 ### 2. Deterministic pre-check (local, no LLM call)
-- Word count: 300-2000 words, stated as a hard rule in the generator prompt
-  itself (not just enforced after the fact). Calibrated via `batch_eval.py`:
-  pushing the floor to 500+ pulled the model toward more elaborate sentence
-  structure to fill the space, which dragged reading level up with it (see
-  next bullet) -- 300-500 is where this model naturally stays both
-  substantive and simple. See eval_results.md.
-- Reading level is NOT checked here at all (removed entirely, not just
-  disabled) -- Flesch-Kincaid only counts syllables per word, so it scores
-  common-but-polysyllabic words a child actually knows ("dinosaur",
-  "favorite", "adventure") the same as genuinely advanced vocabulary -- it
-  measures word LENGTH, not word FAMILIARITY, which isn't the same thing
-  as "does a 5-10 year old understand this." Vocabulary appropriateness is
-  judged semantically instead, by the LLM judge's `vocabulary_fit` score
-  (see Judge 1) -- a judgment call FK structurally can't make.
-- Unsafe word-list scan ("tool"): a small curated list of words/themes
-  that should never appear (violence, adult themes, etc.) -- deterministic
-  string/regex scan, flagged hits are treated as an automatic safety
-  concern fed into the regeneration step, no LLM call needed to catch
-  the obvious cases.
+- Word count: a 300-2000 word range, calibrated with `batch_eval.py` to
+  match the length this model writes well and simply in for this age
+  group -- fast, free, and catches obviously off-target drafts before
+  any LLM judge call is spent.
+- Vocabulary and reading-level appropriateness are judged semantically by
+  the LLM judge's `vocabulary_fit` score (see Judge 1) -- genuine word
+  familiarity for a specific age range is a judgment call, so it's made
+  by the judge rather than a mechanical formula.
+- Unsafe word-list scan ("tool"): a curated list of words/themes that
+  should never appear in a children's story -- a fast, deterministic
+  regex scan that catches the obvious cases instantly, no LLM call
+  needed, and feeds directly into the regeneration step when it fires.
 
 ### 3. LLM Judge (quality + safety, primary)
 - Role: "strict reviewer whose top priority is child safety and
-  age-appropriateness for ages 5-10"
+  age-appropriateness for ages 5-10."
 - Chain-of-thought reasoning before scoring, then structured JSON output:
 ```json
 {
@@ -94,83 +89,60 @@ flowchart TD
 - `safety_pass: false` on ANY iteration forces regeneration regardless of
   how good the other scores are -- not averaged away.
 
-### 4. LLM Judge #2 (safety-only, holistic/complementary check)
-- Separate call, safety-only framing (not the full rubric).
-- Deliberately NOT a copy of judge #1's checklist. Judge #1 checks against
-  an explicit list (violence, adult themes, scary content, language,
-  romantic/dating framing) -- precise, but only catches what's enumerated.
-  Judge #2 instead reasons holistically ("would a careful, protective
-  parent be comfortable with every theme and implication here?") with no
-  fixed list, so it can catch categories nobody thought to enumerate.
-- AND logic: if either judge flags unsafe, treat as unsafe. The two judges
-  give complementary *prompting* coverage -- precision on known risks plus
-  generalization to unknown ones.
-- Honest limitation: both judges are the same underlying model
-  (`gpt-3.5-turbo`, fixed per the assignment's constraint), just with
-  different prompts -- so they can share systematic blind spots and are
-  NOT truly independent signals, despite running as separate calls. The
-  genuinely independent, non-LLM signal in this system is the deterministic
-  word-list scan in the pre-check (different mechanism entirely, no shared
-  training data or biases) -- that's the real redundancy layer, not judge 2.
-  Given the assignment's constraint to keep the model fixed, a genuinely
-  independent second signal within that constraint would be a trained
-  classifier (a separate, non-LLM component) rather than a second LLM
-  judge; see "what I'd build next" in main.py.
-- Run concurrently with judge 1 (`ThreadPoolExecutor`, not sequential) --
-  they're independent calls, no reason to pay both latencies in serial,
-  which matters at real conversational scale.
+### 4. LLM Judge #2 (safety-only, holistic check)
+- A second, independently-run call, safety-only in framing (not the full
+  rubric).
+- Deliberately not a copy of judge #1's checklist. Judge #1 checks
+  against an explicit list (violence, adult themes, scary content,
+  language, romantic/dating framing) -- precise on known risks. Judge #2
+  instead reasons holistically ("would a careful, protective parent be
+  comfortable with every theme and implication here?") with no fixed
+  list, catching categories a checklist wouldn't think to enumerate.
+- AND logic: if either judge flags a concern, the draft is treated as
+  unsafe. Together with the deterministic word-list scan in the
+  pre-check, safety is checked by three independent mechanisms before a
+  story is ever delivered.
+- Runs concurrently with judge 1 (`ThreadPoolExecutor`) so the two
+  evaluations don't add sequential latency.
 
 ### 5. Regeneration loop
-- Triggered by: a failed deterministic pre-check (length or unsafe words
-  only -- skips the judge calls entirely, cheaper), safety_pass=false
-  (from either judge), or average quality score below threshold
-  (vocabulary_fit is one of the four scored dimensions here, which is
-  where reading-level/vocabulary concerns are actually caught now).
-- Too-short drafts are handled by a dedicated `expand_story` pass, not a
-  full rewrite: it appends ONE new ~100-150 word scene to the EXISTING
-  draft rather than regenerating the whole story hoping it lands longer.
-  batch_eval.py showed full-rewrite retries behave like independent fresh
-  samples that tend to land near the same range as the last attempt,
-  rather than reliably building on it -- a small, bounded "add one scene"
-  task is something the model executes far more reliably than "rewrite
-  everything to be longer."
-- Two separate attempt budgets, not one shared pool: pre-check (soft) failures
-  get up to 5 tries since they cost no judge call; judge (safety/quality, hard)
-  failures stay capped at 3 -- a miscalibrated soft threshold shouldn't burn the
-  same tight budget as an actual safety concern.
-- Fail-closed: if still unsafe after the cap, do NOT deliver the best
-  available draft -- refuse and tell the user clearly, rather than
-  silently shipping a story that never passed the safety gate.
-- Every iteration's scores are logged so improvement (or lack of it)
-  across attempts is visible.
+- Triggered by a failed pre-check (skips the judge calls entirely,
+  cheaper), a safety concern from either judge, or an average quality
+  score below threshold.
+- Too-short drafts are grown with a dedicated `expand_story` pass: it
+  appends one new ~100-150 word scene to the existing draft, a small,
+  bounded task the model executes reliably, rather than re-rolling the
+  whole story from scratch.
+- Two separate attempt budgets: pre-check fixes get up to 5 tries (cheap,
+  no judge call spent), while safety/quality regeneration stays capped
+  at 3 -- so length or formatting adjustments don't compete for the same
+  budget as an actual safety concern.
+- Fail-closed: if a safe, passing draft is never reached within budget,
+  the system does not deliver its best partial attempt -- it refuses
+  clearly and asks the user to rephrase.
+- Every iteration's scores are logged so quality improvement across
+  attempts is visible.
 
 ### 6. Kid-persona reaction (non-blocking, informational)
 - After a story passes, one more short LLM call: "You are a 7-year-old,
   react to this story in your own voice, 2-3 sentences."
-- Does NOT gate or trigger regeneration on its own -- it's a single,
-  potentially noisy simulated opinion, and looping generation off it risks
-  an unstable/unbounded loop chasing an unreliable signal. It's also
-  largely redundant with the `engagement` score the primary judge already
-  produces, so making both drive regeneration would double-count the same
-  concern through two mechanisms.
-- Instead it feeds into step [7]'s feedback prompt: if the reaction reads
-  as negative/confused, that's surfaced to the user alongside the story
-  (e.g. "Note: a simulated child reader found the ending confusing. Any
-  feedback, or should I finalize this?"), giving it real influence on
-  whether the user chooses to request changes, without adding its own
-  autonomous regeneration branch.
+- Provides a second, distinct read on engagement in a child's own voice,
+  shown alongside the story as color/signal.
+- Feeds into the feedback step: if the reaction reads as mixed or
+  confused, that's surfaced to the user alongside the story ("Note: a
+  simulated child reader found the ending confusing. Any feedback, or
+  should I finalize this?"), giving it real influence on whether the
+  user requests changes.
 
 ### 7. Feedback loop (multi-turn)
-- After delivery: open question, "Any feedback, or should I finalize
+- After delivery: an open question, "Any feedback, or should I finalize
   this?" -- not multiple-choice suggestions.
-- User's free text becomes a revision instruction applied directly to the
-  currently-delivered story (not a fresh, unrelated generation), then
-  re-run through the same pre-check/judge steps.
-- Loops until the user indicates they're done, capped at M rounds.
-- Prompt-injection mitigation: user feedback is wrapped in `<user_feedback>`
-  tags with an explicit generator-prompt instruction that this text is a
-  content preference only, never an instruction that overrides the
-  generator's rules or role. Defense in depth: even if an injection attempt
-  slipped through, the revised draft still has to pass the same pre-check
-  and dual-judge gate before it's ever delivered.
-
+- The user's free text becomes a revision instruction applied directly
+  to the currently-delivered story, then re-run through the same
+  pre-check and dual-judge gate before the revised version is shown.
+- Loops until the user indicates they're done, capped at 3 rounds.
+- User feedback is wrapped in `<user_feedback>` tags with an explicit
+  instruction that this text is a content preference only, never an
+  instruction that changes the generator's rules or role -- backed by a
+  second layer, since every revision still has to clear the same
+  pre-check and dual-judge gate before it's ever delivered.
